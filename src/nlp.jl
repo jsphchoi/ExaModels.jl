@@ -1168,8 +1168,8 @@ end
 
 
 """
-    add_par(core, dims...; value = 0, name = nothing, tag = nothing, sensitivity = false)
-    add_par(core, value::AbstractArray; name = nothing, tag = nothing, sensitivity = false)
+    add_par(core, dims...; value = 0, name = nothing, tag = nothing, sensitivity = Val(false))
+    add_par(core, value::AbstractArray; name = nothing, tag = nothing, sensitivity = Val(false))
 
 Adds parameters to `core` and returns `(core, Parameter)`.
 
@@ -1181,7 +1181,7 @@ is a convenience that uses `size(value)` as the dimensions.
 - `value`: Initial parameter values. Can be a `Number`, `AbstractArray`, or `Generator`.
 - `name` : When given as `Val(:name)`, registers the parameter in `core` for later retrieval as `core.name` or `model.name`. See [`@add_par`](@ref) for the idiomatic named interface.
 - `tag`  : User-defined metadata attached to the parameter block.
-- `sensitivity`: Enables differentiation with respect to the parameter block if `true`.
+- `sensitivity`: Enables differentiation with respect to the parameter block if `Val(true)`.
 
 ## Example
 ```jldoctest
@@ -1197,24 +1197,24 @@ Parameter
   θ ∈ R^{10}
 ```
 """
-@inline function add_par(c::C, value::AbstractArray; tag = nothing, name = nothing, sensitivity = false) where {T,C<:ExaCore{T}}
+@inline function add_par(c::C, value::AbstractArray; tag = nothing, name = nothing, sensitivity = Val(false)) where {T,C<:ExaCore{T}}
     _add_par(c, tag, name, value, Base.size(value)...; sensitivity)
 end
 
-@inline function add_par(c::C, n::AbstractRange; tag = nothing, name = nothing, value = zero(T), sensitivity = false) where {T,C<:ExaCore{T}}
+@inline function add_par(c::C, n::AbstractRange; tag = nothing, name = nothing, value = zero(T), sensitivity = Val(false)) where {T,C<:ExaCore{T}}
     _add_par(c, tag, name, value, n; sensitivity)
 end
 
-@inline function add_par(c::C, ns...; tag = nothing, name = nothing, value = zero(T), sensitivity = false) where {T,C<:ExaCore{T}}
+@inline function add_par(c::C, ns...; tag = nothing, name = nothing, value = zero(T), sensitivity = Val(false)) where {T,C<:ExaCore{T}}
     _add_par(c, tag, name, value, ns...; sensitivity)
 end
 
-@inline function _add_par(c, tag, name, start, ns...; sensitivity = false)
+@inline function _add_par(c, tag, name, start, ns...; sensitivity = Val(false))
     o = c.npar
     len = total(ns)
     npar = c.npar + len
     θ = _append_slot(c.backend, c.θ, start, len)
-    p = Parameter(ns, len, o, tag, Val(sensitivity))
+    p = Parameter(ns, len, o, tag, sensitivity)
     (ExaCore(c; par = _prep(c.par, p), θ=θ, npar=npar, refs = add_refs(c.refs, name, p)), p)
 end
 
@@ -2002,9 +2002,9 @@ end
 
 # ── Parameter sensitivity ─────────────────────────────────────────────────────
 
-# Same pattern over the parameter sparse index, at offsets `o1` and `o2`.
+# Same pattern over the parameter sparse index, with one spare slot per element.
 @inline _view_par(f::SIMDFunction, o1, o2) = SIMDFunction(
-    f.f, f.comp1p, f.comp2p, f.o0, o1, o2, f.o1pstep, f.o2pstep, Compressor{Tuple{}}(()), Compressor{Tuple{}}(()), 0, 0,
+    f.f, f.comp1p, f.comp2p, f.o0, o1, o2, f.o1pstep + 1, f.o2pstep + 1, Compressor{Tuple{}}(()), Compressor{Tuple{}}(()), 0, 0,
 )
 @inline _view_par(o::Objective, o1, o2) = Objective(_view_par(o.f, o1, o2), o.itr)
 @inline _view_par(c::Constraint, o1, o2) =
@@ -2019,110 +2019,126 @@ end
 
 # Reverse pass on the CPU or on the KernelAbstractions backend.
 @inline _sjacobian!(::Nothing, args...) = sjacobian!(args...)
-@inline _sjacobian!(ext, args...) = sjacobian!(ext.backend, args...)
+@inline _sjacobian!(backend, args...) = sjacobian!(backend, args...)
 @inline _shessian!(::Nothing, args...) = shessian!(args...)
-@inline _shessian!(ext, args...) = shessian!(ext.backend, args...)
+@inline _shessian!(backend, args...) = shessian!(backend, args...)
+@inline _backend(::Nothing) = nothing
+@inline _backend(ext) = ext.backend
 
-get_nnzj_par(m::AbstractExaModel) = _nnzj_par(m.cons)
+# Blocks added with `sensitivity = Val(true)` as `(offset in θ, offset in get_par, length)`, in the order of `θ`.
+function _par_blocks(pars)
+    blocks, o = Tuple{Int,Int,Int}[], 0
+    for θ in sort!(filter(θ -> _sensitivity(θ) === Val(true), collect(pars)); by = θ -> θ.offset)
+        push!(blocks, (θ.offset, o, θ.length))
+        o += θ.length
+    end
+    return blocks
+end
+_npar(pars) = sum(b[3] for b in _par_blocks(pars); init = 0)
 
-get_nnzh_par(m::AbstractExaModel) = _nnzh_par(m.objs) + _nnzh_par(m.cons)
-
-function jac_structure_par!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T}
-    θ = ParameterAdjointSource(NaNSource{T}(), 0)
-    _jac_par!(m.ext, m.cons, ParameterAdjointResult(rows), ParameterAdjointResult(cols), NaNSource{T}(), θ, T(NaN), 0)
-    return rows, cols
+# Column of `get_par` for each entry of `θ`, zero outside the `sensitivity = Val(true)` blocks.
+function _par_colmap(pars, θ)
+    colmap = zeros(Int, length(θ))
+    for (o, oc, n) in _par_blocks(pars)
+        colmap[o .+ (1:n)] .= oc .+ (1:n)
+    end
+    return copyto!(similar(θ, Int, length(θ)), colmap)
 end
 
-function jac_coord_par!(m::AbstractExaModel, x::AbstractVector, vals::AbstractVector)
-    fill!(vals, zero(eltype(vals)))
-    θ = ParameterAdjointSource(m.θ, 0)
-    _jac_par!(m.ext, m.cons, ParameterAdjointResult(vals), nothing, x, θ, one(eltype(vals)), 0)
+get_par_meta(m::AbstractExaModel) = ParametricNLPModelMeta(;
+    npar = _npar(m.pars),
+    nnzj_par = _nnzj_par(m.cons),
+    nnzh_par = _nnzh_par(m.objs) + _nnzh_par(m.cons),
+    grad_par_available = false,
+)
+
+function get_par(m::AbstractExaModel)
+    θ = similar(m.θ, get_npar(m))
+    for (o, oc, n) in _par_blocks(m.pars)
+        copyto!(θ, oc + 1, m.θ, o + 1, n)
+    end
+    return θ
+end
+
+function set_par!(m::AbstractExaModel, values::AbstractVector)
+    for (o, oc, n) in _par_blocks(m.pars)
+        copyto!(m.θ, o + 1, values, oc + 1, n)
+    end
+    return m
+end
+
+# Scratch of `n × (k + 1)` for the pass of one function, of which the first `k` rows are kept.
+_scratch(::Nothing, n) = nothing
+_scratch(y, n) = fill!(similar(y, n), zero(eltype(y)))
+_keep!(::Nothing, s, k, o) = nothing
+function _keep!(y, s, k, o)
+    n = length(s) ÷ (k + 1)
+    reshape(view(y, o .+ (1:(n * k))), k, n) .= view(reshape(s, k + 1, n), 1:k, :)
+    return y
+end
+
+_jac_par!(backend, ::Tuple{}, y1, y2, x, θ, adj, o1) = o1
+@inline function _jac_par!(backend, cons::Tuple, y1, y2, x, θ, adj, o1)
+    o1 = _jac_par!(backend, Base.tail(cons), y1, y2, x, θ, adj, o1)
+    con = first(cons)
+    k, n = con.f.o1pstep, length(con.itr)
+    k > 0 || return o1
+    s1, s2 = _scratch(y1, n * (k + 1)), _scratch(y2, n * (k + 1))
+    _sjacobian!(backend, s1, s2, _view_par(con, 0, 0), x, θ, adj)
+    _keep!(y1, s1, k, o1)
+    _keep!(y2, s2, k, o1)
+    return o1 + n * k
+end
+
+function _jac_par_structure!(::Type{T}, backend, cons, colmap, rows, cols) where {T}
+    _jac_par!(backend, cons, rows, cols, NaNSource{T}(), ParameterAdjointSource(NaNSource{T}(), 0), T(NaN), 0)
+    cols .= colmap[cols]
+    return rows, cols
+end
+jac_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
+    _jac_par_structure!(T, _backend(m.ext), m.cons, _par_colmap(m.pars, m.θ), rows, cols)
+
+function jac_par_coord!(m::AbstractExaModel, x::AbstractVector, vals::AbstractVector)
+    _jac_par!(_backend(m.ext), m.cons, vals, nothing, x, ParameterAdjointSource(m.θ, 0), one(eltype(vals)), 0)
     return vals
 end
 
-_jac_par!(ext, ::Tuple{}, y1, y2, x, θ, adj, o1) = o1
-@inline function _jac_par!(ext, cons::Tuple, y1, y2, x, θ, adj, o1)
-    o1 = _jac_par!(ext, Base.tail(cons), y1, y2, x, θ, adj, o1)
-    con = first(cons)
-    _nnzj_par(con) > 0 && _sjacobian!(ext, y1, y2, _view_par(con, o1, 0), x, θ, adj)
-    return o1 + _nnzj_par(con)
+_hess_par!(backend, ::Tuple{}, y1, y2, x, θ, adj1, adj2, o2) = o2
+@inline function _hess_par!(backend, fs::Tuple, y1, y2, x, θ, adj1, adj2, o2)
+    o2 = _hess_par!(backend, Base.tail(fs), y1, y2, x, θ, adj1, adj2, o2)
+    f = first(fs)
+    k, n = f.f.o2pstep, length(f.itr)
+    k > 0 || return o2
+    s1, s2 = _scratch(y1, n * (k + 1)), _scratch(y2, n * (k + 1))
+    _shessian!(backend, s1, s2, _view_par(f, 0, 0), x, θ, adj1, adj2)
+    _keep!(y1, s1, k, o2)
+    _keep!(y2, s2, k, o2)
+    return o2 + n * k
 end
 
-function hess_structure_par!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T}
-    # The pass writes (nvar + j, i).
-    θ = ParameterAdjointSource(NaNSource{T}(), m.meta.nvar)
-    y1, y2 = ParameterAdjointResult(cols), ParameterAdjointResult(rows)
-    o2 = _hess_par!(m.ext, m.objs, y1, y2, NaNSource{T}(), θ, T(NaN), T(NaN), 0)
-    _hess_par!(m.ext, m.cons, y1, y2, NaNSource{T}(), θ, T(NaN), T(NaN), o2)
-    cols .-= m.meta.nvar
+# The pass writes the parameter index, shifted by `nvar`, first.
+function _hess_par_structure!(::Type{T}, backend, objs, cons, nvar, colmap, rows, cols) where {T}
+    θ = ParameterAdjointSource(NaNSource{T}(), nvar)
+    o2 = _hess_par!(backend, objs, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), 0)
+    _hess_par!(backend, cons, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), o2)
+    cols .= colmap[cols .- nvar]
     return rows, cols
 end
+hess_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
+    _hess_par_structure!(T, _backend(m.ext), m.objs, m.cons, m.meta.nvar, _par_colmap(m.pars, m.θ), rows, cols)
 
-function hess_coord_par!(
+function hess_par_coord!(
     m::AbstractExaModel,
     x::AbstractVector,
     y::AbstractVector,
     vals::AbstractVector;
     obj_weight = one(eltype(x)),
 )
-    fill!(vals, zero(eltype(vals)))
-    θ = ParameterAdjointSource(m.θ, m.meta.nvar)
-    w = ParameterAdjointResult(vals)
-    o2 = _hess_par!(m.ext, m.objs, w, nothing, x, θ, obj_weight, zero(eltype(vals)), 0)
-    _hess_par!(m.ext, m.cons, w, nothing, x, θ, y, zero(eltype(vals)), o2)
+    backend, θ = _backend(m.ext), ParameterAdjointSource(m.θ, m.meta.nvar)
+    o2 = _hess_par!(backend, m.objs, vals, nothing, x, θ, obj_weight, zero(eltype(vals)), 0)
+    _hess_par!(backend, m.cons, vals, nothing, x, θ, y, zero(eltype(vals)), o2)
     return vals
 end
-
-_hess_par!(ext, ::Tuple{}, y1, y2, x, θ, adj1, adj2, o2) = o2
-@inline function _hess_par!(ext, fs::Tuple, y1, y2, x, θ, adj1, adj2, o2)
-    o2 = _hess_par!(ext, Base.tail(fs), y1, y2, x, θ, adj1, adj2, o2)
-    f = first(fs)
-    _nnzh_par(f) > 0 && _shessian!(ext, y1, y2, _view_par(f, 0, o2), x, θ, adj1, adj2)
-    return o2 + _nnzh_par(f)
-end
-
-_par_colmap(m::AbstractExaModel, θ::Parameter) =
-    _sensitivity(θ) === Val(true) ? _par_colmap(m, (θ,)) :
-    throw(ArgumentError("parameter block was not added with sensitivity = true"))
-function _par_colmap(m::AbstractExaModel, θs = m.pars)
-    colmap, n = zeros(Int, length(m.θ)), 0
-    for θ in sort!(filter(θ -> _sensitivity(θ) === Val(true), collect(θs)); by = θ -> θ.offset)
-        colmap[θ.offset .+ (1:θ.length)] .= n .+ (1:θ.length)
-        n += θ.length
-    end
-    return copyto!(similar(m.meta.x0, Int, length(colmap)), colmap), n
-end
-
-function _scatter_par!(::Nothing, A, rows, cols, vals, colmap)
-    @inbounds for k in eachindex(vals)
-        j = colmap[cols[k]]
-        j > 0 && (A[rows[k], j] += vals[k])
-    end
-    return A
-end
-
-function _par_dense(m, x, θ, nrow, nnz, structure!, coord!)
-    colmap, k = _par_colmap(m, θ)
-    rows, cols = structure!(m, similar(x, Int, nnz), similar(x, Int, nnz))
-    A = fill!(similar(x, nrow, k), zero(eltype(x)))
-    return _scatter_par!(m.ext, A, rows, cols, coord!(similar(x, nnz)), colmap)
-end
-
-# Calculates ∂c/∂θ at x, a dense ncon × nθ matrix.
-jac_par(m::AbstractExaModel, x::AbstractVector, θ = m.pars) =
-    _par_dense(m, x, θ, m.meta.ncon, get_nnzj_par(m), jac_structure_par!, v -> jac_coord_par!(m, x, v))
-
-# Calculates ∂²L/∂x∂θ at x and y, a dense nvar × nθ matrix.
-hess_par(m::AbstractExaModel, x::AbstractVector, y::AbstractVector, θ = m.pars; obj_weight = one(eltype(x))) =
-    _par_dense(m, x, θ, m.meta.nvar, get_nnzh_par(m), hess_structure_par!, v -> hess_coord_par!(m, x, y, v; obj_weight))
-
-# Calculates (∂²L/∂x∂θ, ∂c/∂θ) at x and y for MadNLP.sensitivity.
-(m::AbstractExaModel)(x::AbstractVector, y::AbstractVector) = (hess_par(m, x, y), jac_par(m, x))
-(m::AbstractExaModel)(θ::Parameter, x::AbstractVector, y::AbstractVector) =
-    (hess_par(m, x, y, θ), jac_par(m, x, θ))
-
-Base.getindex(m::Union{ExaCore,ExaModel}, θ::Parameter) = get_value(m, θ)
-Base.setindex!(m::Union{ExaCore,ExaModel}, values, θ::Parameter) = (set_value!(m, θ, values); m)
 
 @inbounds @inline offset0(a, i) = offset0(a.f, i)
 @inbounds @inline offset0(a::Constraint, i) = offset0(a.f, a.itr, i, _constraint_dims(a))

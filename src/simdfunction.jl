@@ -27,7 +27,7 @@ struct SIMDFunction{F,C1,C2,O0,O1,O2,C1P,C2P}
     o2::O2
     o1step::Int
     o2step::Int
-    # Sparse index over the `sensitivity = true` parameters, see `_sparsity_par`.
+    # Sparse index over the `sensitivity = Val(true)` parameters, see `_sparsity_par`.
     comp1p::C1P
     comp2p::C2P
     o1pstep::Int
@@ -102,17 +102,14 @@ end
     SIMDFunction(f, c1, c2, o0, o1, o2, o1step, o2step, c1p, c2p, o1pstep, o2pstep)
 end
 
-# Compressor index of the entries with no output, see `ParameterAdjointResult`.
-const _EMPTY = typemax(Int) >> 1
-
-# Sparse index of `raw`, sending the entries `keep` rejects to `_EMPTY`.
+# Sparse index of `raw`, sending the entries `keep` rejects to one spare slot after the kept ones.
 function _compressor(raw, n, keep = Returns(true))
     unique = _ident_unique(filter(keep, raw))
-    mapping = Int[keep(x) ? findfirst(y -> y === x, unique) : _EMPTY for x in raw]
+    mapping = Int[keep(x) ? findfirst(y -> y === x, unique) : length(unique) + 1 for x in raw]
     return Compressor(ntuple(i -> mapping[i], n)), length(unique)
 end
 
-# Sparse index of ∂c/∂θ and ∂²L/∂x∂θ over the `sensitivity = true` parameters.
+# Sparse index of ∂c/∂θ and ∂²L/∂x∂θ over the `sensitivity = Val(true)` parameters.
 _sparsity_par(T, f, ::Val{false}) = (Compressor{Tuple{}}(()), Compressor{Tuple{}}(()), 0, 0)
 function _sparsity_par(T, f, ::Val{true})
     θ = ParameterAdjointSource(NaNSource{T}(), 0)
@@ -131,7 +128,7 @@ end
 _is_parameter(k) = k isa ParameterNode
 _is_mixed((a, b)) = xor(a isa ParameterNode, b isa ParameterNode)
 
-# Whether the graph has a `sensitivity = true` parameter.
+# Whether the graph has a `sensitivity = Val(true)` parameter.
 _has_par(::Type) = Val(false)
 _has_par(::Type{ParameterNode{I,S}}) where {I,S} = Val(S)
 _has_par(::Type{Node1{F,I}}) where {F,I} = _has_par(I)

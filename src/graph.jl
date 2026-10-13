@@ -505,7 +505,7 @@ end
 """
     ParameterAdjointSource{VT}
 
-Parameter vector that turns a `sensitivity = true` [`ParameterNode`](@ref) into an
+Parameter vector that turns a `sensitivity = Val(true)` [`ParameterNode`](@ref) into an
 [`AdjointNodeVar`](@ref) or [`SecondAdjointNodeVar`](@ref) leaf at index `i + offset`.
 
 # Fields
@@ -530,28 +530,6 @@ end
     @inbounds _leaf(x)(v.i + θ.offset, θ.inner[v.i])
 @inline (v::ParameterNode{I,true})(::Identity, x, θ::ParameterAdjointSource) where {I<:AbstractNode} = x[v]
 @inline (v::ParameterNode{I,true})(::Identity, x, θ::ParameterAdjointSource) where {I<:Real} = x[v]
-
-"""
-    ParameterAdjointResult{T, V} <: AbstractVector{T}
-
-Output vector `v` of the `∂c/∂θ` and `∂²L/∂x∂θ` passes.
-
-Keeps the entries of `θ` in `v` and removes the entires in `x`.
-
-# Fields
-- `v::V`: output vector
-"""
-struct ParameterAdjointResult{T,V} <: AbstractVector{T}
-    v::V
-end
-@inline ParameterAdjointResult(v::V) where {V} = ParameterAdjointResult{eltype(V),V}(v)
-Base.size(s::ParameterAdjointResult) = size(s.v)
-@inline Base.getindex(s::ParameterAdjointResult{T}, i::Integer) where {T} =
-    @inbounds i <= length(s.v) ? s.v[i] : zero(T)
-@inline function Base.setindex!(s::ParameterAdjointResult, x, i::Integer)
-    @inbounds i <= length(s.v) && (s.v[i] = x)
-    return x
-end
 
 @inline (v::Null{Nothing})(i, x::V, θ) where {T,V<:AbstractVector{T}} = zero(T)
 @inline (v::Null{N})(i, x::V, θ) where {N,T,V<:AbstractVector{T}} = T(v.value)
