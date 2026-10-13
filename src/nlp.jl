@@ -2002,49 +2002,6 @@ end
 
 # ── Parameter sensitivity ─────────────────────────────────────────────────────
 
-# Same pattern over the parameter sparse index, with one spare slot per element.
-@inline _view_par(f::SIMDFunction, o1, o2) = SIMDFunction(
-    f.f, f.comp1p, f.comp2p, f.o0, o1, o2, f.o1pstep + 1, f.o2pstep + 1, Compressor{Tuple{}}(()), Compressor{Tuple{}}(()), 0, 0,
-)
-@inline _view_par(o::Objective, o1, o2) = Objective(_view_par(o.f, o1, o2), o.itr)
-@inline _view_par(c::Constraint, o1, o2) =
-    Constraint(_view_par(c.f, o1, o2), c.itr, c.offset, c.size, c.tag)
-@inline _view_par(c::ConstraintAugmentation, o1, o2) =
-    ConstraintAugmentation(_view_par(c.f, o1, o2), c.itr, c.oa, c.dims, c.tag)
-
-@inline _nnzj_par(a) = length(a.itr) * a.f.o1pstep
-@inline _nnzh_par(a) = length(a.itr) * a.f.o2pstep
-@inline _nnzj_par(as::Tuple) = sum(_nnzj_par, as; init = 0)
-@inline _nnzh_par(as::Tuple) = sum(_nnzh_par, as; init = 0)
-
-# Reverse pass on the CPU or on the KernelAbstractions backend.
-@inline _sjacobian!(::Nothing, args...) = sjacobian!(args...)
-@inline _sjacobian!(backend, args...) = sjacobian!(backend, args...)
-@inline _shessian!(::Nothing, args...) = shessian!(args...)
-@inline _shessian!(backend, args...) = shessian!(backend, args...)
-@inline _backend(::Nothing) = nothing
-@inline _backend(ext) = ext.backend
-
-# Blocks added with `sensitivity = Val(true)` as `(offset in θ, offset in get_par, length)`, in the order of `θ`.
-function _par_blocks(pars)
-    blocks, o = Tuple{Int,Int,Int}[], 0
-    for θ in sort!(filter(θ -> _sensitivity(θ) === Val(true), collect(pars)); by = θ -> θ.offset)
-        push!(blocks, (θ.offset, o, θ.length))
-        o += θ.length
-    end
-    return blocks
-end
-_npar(pars) = sum(b[3] for b in _par_blocks(pars); init = 0)
-
-# Column of `get_par` for each entry of `θ`, zero outside the `sensitivity = Val(true)` blocks.
-function _par_colmap(pars, θ)
-    colmap = zeros(Int, length(θ))
-    for (o, oc, n) in _par_blocks(pars)
-        colmap[o .+ (1:n)] .= oc .+ (1:n)
-    end
-    return copyto!(similar(θ, Int, length(θ)), colmap)
-end
-
 get_par_meta(m::AbstractExaModel) = ParametricNLPModelMeta(;
     npar = _npar(m.pars),
     nnzj_par = _nnzj_par(m.cons),
@@ -2052,29 +2009,60 @@ get_par_meta(m::AbstractExaModel) = ParametricNLPModelMeta(;
     grad_par_available = false,
 )
 
-function get_par(m::AbstractExaModel)
-    θ = similar(m.θ, get_npar(m))
-    for (o, oc, n) in _par_blocks(m.pars)
-        copyto!(θ, oc + 1, m.θ, o + 1, n)
+_npar(pars) = sum(len for (_, _, len) in _par_blocks(pars); init = 0)
+
+# Blocks added with `sensitivity = Val(true)` as `(offset in θ, offset in get_par, length)`, in the order of `θ`.
+function _par_blocks(pars)
+    blocks, par_offset = Tuple{Int,Int,Int}[], 0
+    for p in sort!(filter(p -> _sensitivity(p) === Val(true), collect(pars)); by = p -> p.offset)
+        push!(blocks, (p.offset, par_offset, p.length))
+        par_offset += p.length
     end
-    return θ
+    return blocks
+end
+
+@inline _nnzj_par(a) = length(a.itr) * a.f.o1pstep
+@inline _nnzh_par(a) = length(a.itr) * a.f.o2pstep
+@inline _nnzj_par(as::Tuple) = sum(_nnzj_par, as; init = 0)
+@inline _nnzh_par(as::Tuple) = sum(_nnzh_par, as; init = 0)
+
+function get_par(m::AbstractExaModel)
+    par = similar(m.θ, get_npar(m))
+    for (θ_offset, par_offset, len) in _par_blocks(m.pars)
+        copyto!(par, par_offset + 1, m.θ, θ_offset + 1, len)
+    end
+    return par
 end
 
 function set_par!(m::AbstractExaModel, values::AbstractVector)
-    for (o, oc, n) in _par_blocks(m.pars)
-        copyto!(m.θ, o + 1, values, oc + 1, n)
+    _check_len(length(values), get_npar(m), "set_par!")
+    for (θ_offset, par_offset, len) in _par_blocks(m.pars)
+        copyto!(m.θ, θ_offset + 1, values, par_offset + 1, len)
     end
     return m
 end
 
-# Scratch of `n × (k + 1)` for the pass of one function, of which the first `k` rows are kept.
-_scratch(::Nothing, n) = nothing
-_scratch(y, n) = fill!(similar(y, n), zero(eltype(y)))
-_keep!(::Nothing, s, k, o) = nothing
-function _keep!(y, s, k, o)
-    n = length(s) ÷ (k + 1)
-    reshape(view(y, o .+ (1:(n * k))), k, n) .= view(reshape(s, k + 1, n), 1:k, :)
-    return y
+jac_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
+    _jac_par_structure!(T, getbackend(m), m.cons, _par_colmap(m.pars, m.θ), rows, cols)
+
+# Column of `get_par` for each entry of `θ`, zero outside the `sensitivity = Val(true)` blocks.
+function _par_colmap(pars, θ)
+    colmap = zeros(Int, length(θ))
+    for (θ_offset, par_offset, len) in _par_blocks(pars)
+        colmap[θ_offset .+ (1:len)] .= par_offset .+ (1:len)
+    end
+    return copyto!(similar(θ, Int, length(θ)), colmap)
+end
+
+function _jac_par_structure!(::Type{T}, backend, cons, colmap, rows, cols) where {T}
+    _jac_par!(backend, cons, rows, cols, NaNSource{T}(), ParameterAdjointSource(NaNSource{T}(), 0), T(NaN), 0)
+    cols .= colmap[cols]
+    return rows, cols
+end
+
+function jac_par_coord!(m::AbstractExaModel, x::AbstractVector, vals::AbstractVector)
+    _jac_par!(getbackend(m), m.cons, vals, nothing, x, ParameterAdjointSource(m.θ, 0), one(eltype(vals)), 0)
+    return vals
 end
 
 _jac_par!(backend, ::Tuple{}, y1, y2, x, θ, adj, o1) = o1
@@ -2084,22 +2072,60 @@ _jac_par!(backend, ::Tuple{}, y1, y2, x, θ, adj, o1) = o1
     k, n = con.f.o1pstep, length(con.itr)
     k > 0 || return o1
     s1, s2 = _scratch(y1, n * (k + 1)), _scratch(y2, n * (k + 1))
-    _sjacobian!(backend, s1, s2, _view_par(con, 0, 0), x, θ, adj)
+    _sjacobian!(backend, s1, s2, _view_par(con), x, θ, adj)
     _keep!(y1, s1, k, o1)
     _keep!(y2, s2, k, o1)
     return o1 + n * k
 end
 
-function _jac_par_structure!(::Type{T}, backend, cons, colmap, rows, cols) where {T}
-    _jac_par!(backend, cons, rows, cols, NaNSource{T}(), ParameterAdjointSource(NaNSource{T}(), 0), T(NaN), 0)
-    cols .= colmap[cols]
+# Scratch of `(k + 1) × n` for the pass of one function, of which the first `k` rows are kept.
+_scratch(::Nothing, len) = nothing
+_scratch(y, len) = fill!(similar(y, len), zero(eltype(y)))
+_keep!(::Nothing, s, k, o) = nothing
+function _keep!(y, s, k, o)
+    n = length(s) ÷ (k + 1)
+    reshape(view(y, o .+ (1:(n * k))), k, n) .= view(reshape(s, k + 1, n), 1:k, :)
+    return y
+end
+
+# Reverse pass on the CPU or on the KernelAbstractions backend.
+@inline _sjacobian!(::Nothing, args...) = sjacobian!(args...)
+@inline _sjacobian!(backend, args...) = sjacobian!(backend, args...)
+@inline _shessian!(::Nothing, args...) = shessian!(args...)
+@inline _shessian!(backend, args...) = shessian!(backend, args...)
+
+# Same pattern over the parameter sparse index, with one spare slot per element.
+@inline _view_par(f::SIMDFunction) = SIMDFunction(
+    f.f, f.comp1p, f.comp2p, f.o0, 0, 0, f.o1pstep + 1, f.o2pstep + 1, Compressor{Tuple{}}(()), Compressor{Tuple{}}(()), 0, 0,
+)
+@inline _view_par(o::Objective) = Objective(_view_par(o.f), o.itr)
+@inline _view_par(c::Constraint) =
+    Constraint(_view_par(c.f), c.itr, c.offset, c.size, c.tag)
+@inline _view_par(c::ConstraintAugmentation) =
+    ConstraintAugmentation(_view_par(c.f), c.itr, c.oa, c.dims, c.tag)
+
+hess_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
+    _hess_par_structure!(T, getbackend(m), m.objs, m.cons, m.meta.nvar, _par_colmap(m.pars, m.θ), rows, cols)
+
+# The pass writes the parameter index, shifted by `nvar`, first.
+function _hess_par_structure!(::Type{T}, backend, objs, cons, nvar, colmap, rows, cols) where {T}
+    θ = ParameterAdjointSource(NaNSource{T}(), nvar)
+    o2 = _hess_par!(backend, objs, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), 0)
+    _hess_par!(backend, cons, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), o2)
+    cols .= colmap[cols .- nvar]
     return rows, cols
 end
-jac_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
-    _jac_par_structure!(T, _backend(m.ext), m.cons, _par_colmap(m.pars, m.θ), rows, cols)
 
-function jac_par_coord!(m::AbstractExaModel, x::AbstractVector, vals::AbstractVector)
-    _jac_par!(_backend(m.ext), m.cons, vals, nothing, x, ParameterAdjointSource(m.θ, 0), one(eltype(vals)), 0)
+function hess_par_coord!(
+    m::AbstractExaModel,
+    x::AbstractVector,
+    y::AbstractVector,
+    vals::AbstractVector;
+    obj_weight = one(eltype(x)),
+)
+    backend, θ = getbackend(m), ParameterAdjointSource(m.θ, m.meta.nvar)
+    o2 = _hess_par!(backend, m.objs, vals, nothing, x, θ, obj_weight, zero(eltype(vals)), 0)
+    _hess_par!(backend, m.cons, vals, nothing, x, θ, y, zero(eltype(vals)), o2)
     return vals
 end
 
@@ -2110,34 +2136,10 @@ _hess_par!(backend, ::Tuple{}, y1, y2, x, θ, adj1, adj2, o2) = o2
     k, n = f.f.o2pstep, length(f.itr)
     k > 0 || return o2
     s1, s2 = _scratch(y1, n * (k + 1)), _scratch(y2, n * (k + 1))
-    _shessian!(backend, s1, s2, _view_par(f, 0, 0), x, θ, adj1, adj2)
+    _shessian!(backend, s1, s2, _view_par(f), x, θ, adj1, adj2)
     _keep!(y1, s1, k, o2)
     _keep!(y2, s2, k, o2)
     return o2 + n * k
-end
-
-# The pass writes the parameter index, shifted by `nvar`, first.
-function _hess_par_structure!(::Type{T}, backend, objs, cons, nvar, colmap, rows, cols) where {T}
-    θ = ParameterAdjointSource(NaNSource{T}(), nvar)
-    o2 = _hess_par!(backend, objs, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), 0)
-    _hess_par!(backend, cons, cols, rows, NaNSource{T}(), θ, T(NaN), T(NaN), o2)
-    cols .= colmap[cols .- nvar]
-    return rows, cols
-end
-hess_par_structure!(m::AbstractExaModel{T}, rows::AbstractVector, cols::AbstractVector) where {T} =
-    _hess_par_structure!(T, _backend(m.ext), m.objs, m.cons, m.meta.nvar, _par_colmap(m.pars, m.θ), rows, cols)
-
-function hess_par_coord!(
-    m::AbstractExaModel,
-    x::AbstractVector,
-    y::AbstractVector,
-    vals::AbstractVector;
-    obj_weight = one(eltype(x)),
-)
-    backend, θ = _backend(m.ext), ParameterAdjointSource(m.θ, m.meta.nvar)
-    o2 = _hess_par!(backend, m.objs, vals, nothing, x, θ, obj_weight, zero(eltype(vals)), 0)
-    _hess_par!(backend, m.cons, vals, nothing, x, θ, y, zero(eltype(vals)), o2)
-    return vals
 end
 
 @inbounds @inline offset0(a, i) = offset0(a.f, i)

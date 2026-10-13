@@ -523,8 +523,27 @@ end
 end
 Adapt.@adapt_structure ExaModels.ParameterAdjointSource
 
+# Buffers and sorted sparsity of ∂c/∂θ and ∂²L/∂x∂θ, `nothing` without `sensitivity = Val(true)` parameters.
+function _build_parhelper(T, c)
+    nnzj, nnzh = ExaModels._nnzj_par(c.cons), ExaModels._nnzh_par(c.obj) + ExaModels._nnzh_par(c.cons)
+    nnzj + nnzh > 0 || return nothing
+    colmap = ExaModels._par_colmap(c.par, c.θ)
+    rows, cols = ExaModels._jac_par_structure!(
+        T, c.backend, c.cons, colmap, similar(c.x0, Int, nnzj), similar(c.x0, Int, nnzj),
+    )
+    ji, jptri, jptrij, jj, jptrj = _sorted_sparsity_par(c.backend, rows, cols)
+    rows, cols = ExaModels._hess_par_structure!(
+        T, c.backend, c.obj, c.cons, c.nvar, colmap, similar(c.x0, Int, nnzh), similar(c.x0, Int, nnzh),
+    )
+    hi, hptri, hptrij, hj, hptrj = _sorted_sparsity_par(c.backend, rows, cols)
+    return (
+        jacbuffer = similar(c.x0, nnzj), jacsparsityi = ji, jacptri = jptri, jacptrij = jptrij, jacsparsityj = jj, jacptrj = jptrj,
+        hessbuffer = similar(c.x0, nnzh), hesssparsityi = hi, hessptri = hptri, hessptrij = hptrij, hesssparsityj = hj, hessptrj = hptrj,
+    )
+end
+
 # Triplets `((i, j), ind)` sorted by pair with the row and pair pointers, and sorted by column with the column pointer.
-function _par_sparsity(backend, rows, cols)
+function _sorted_sparsity_par(backend, rows, cols)
     coordi = tuple.(tuple.(rows, cols), eachindex(rows))
     coordj = copy(coordi)
     isempty(coordi) || ExaModels.sort!(coordi; lt = (a, b) -> a[1] < b[1])
@@ -535,44 +554,13 @@ function _par_sparsity(backend, rows, cols)
     return coordi, ptri, ptrij, coordj, ptrj
 end
 
-# Buffers and sorted sparsity of ∂c/∂θ and ∂²L/∂x∂θ, `nothing` without `sensitivity = Val(true)` parameters.
-function _build_parhelper(T, c)
-    nnzj, nnzh = ExaModels._nnzj_par(c.cons), ExaModels._nnzh_par(c.obj) + ExaModels._nnzh_par(c.cons)
-    nnzj + nnzh > 0 || return nothing
-    colmap = ExaModels._par_colmap(c.par, c.θ)
-    rows, cols = ExaModels._jac_par_structure!(
-        T, c.backend, c.cons, colmap, similar(c.x0, Int, nnzj), similar(c.x0, Int, nnzj),
-    )
-    ji, jptri, jptrij, jj, jptrj = _par_sparsity(c.backend, rows, cols)
-    rows, cols = ExaModels._hess_par_structure!(
-        T, c.backend, c.obj, c.cons, c.nvar, colmap, similar(c.x0, Int, nnzh), similar(c.x0, Int, nnzh),
-    )
-    hi, hptri, hptrij, hj, hptrj = _par_sparsity(c.backend, rows, cols)
-    return (
-        jacbuffer = similar(c.x0, nnzj), jacsparsityi = ji, jacptri = jptri, jacptrij = jptrij, jacsparsityj = jj, jacptrj = jptrj,
-        hessbuffer = similar(c.x0, nnzh), hesssparsityi = hi, hessptri = hptri, hessptrij = hptrij, hesssparsityj = hj, hessptrj = hptrj,
-    )
-end
-
-function _spmv!(backend, kernel, y, v, coord, vals, ptr)
-    fill!(y, zero(eltype(y)))
-    isempty(coord) || kernel(backend)(y, v, coord, vals, ptr; ndrange = length(ptr) - 1)
-    synchronize(backend)
-    return y
-end
-
-function _scatter!(backend, A, coord, vals, ptr)
-    fill!(A, zero(eltype(A)))
-    isempty(coord) || kerscatter(backend)(A, coord, vals, ptr; ndrange = length(ptr) - 1)
-    synchronize(backend)
-    return A
-end
-
 function ExaModels.jac_par_dense!(
     m::ExaModels.AbstractExaModel{T,VT,E},
     x::AbstractVector,
     Jθ::AbstractMatrix,
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x
+    ExaModels._check_len(size(Jθ), (m.meta.ncon, ExaModels.get_npar(m)), "jac_par_dense! Jθ")
     h = m.ext.parhelper
     h === nothing && return fill!(Jθ, zero(eltype(Jθ)))
     ExaModels.jac_par_coord!(m, x, h.jacbuffer)
@@ -586,6 +574,9 @@ function ExaModels.hess_par_dense!(
     Hxθ::AbstractMatrix;
     obj_weight = one(eltype(x)),
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x
+    NLPModels.@lencheck m.meta.ncon y
+    ExaModels._check_len(size(Hxθ), (m.meta.nvar, ExaModels.get_npar(m)), "hess_par_dense! Hxθ")
     h = m.ext.parhelper
     h === nothing && return fill!(Hxθ, zero(eltype(Hxθ)))
     ExaModels.hess_par_coord!(m, x, y, h.hessbuffer; obj_weight)
@@ -598,6 +589,9 @@ function ExaModels.jprod_par!(
     v::AbstractVector,
     Jv::AbstractVector,
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x
+    NLPModels.@lencheck ExaModels.get_npar(m) v
+    NLPModels.@lencheck m.meta.ncon Jv
     h = m.ext.parhelper
     h === nothing && return fill!(Jv, zero(eltype(Jv)))
     ExaModels.jac_par_coord!(m, x, h.jacbuffer)
@@ -610,6 +604,9 @@ function ExaModels.jtprod_par!(
     v::AbstractVector,
     Jtv::AbstractVector,
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x
+    NLPModels.@lencheck m.meta.ncon v
+    NLPModels.@lencheck ExaModels.get_npar(m) Jtv
     h = m.ext.parhelper
     h === nothing && return fill!(Jtv, zero(eltype(Jtv)))
     ExaModels.jac_par_coord!(m, x, h.jacbuffer)
@@ -624,6 +621,9 @@ function ExaModels.hprod_par!(
     Hv::AbstractVector;
     obj_weight = one(eltype(x)),
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x Hv
+    NLPModels.@lencheck m.meta.ncon y
+    NLPModels.@lencheck ExaModels.get_npar(m) v
     h = m.ext.parhelper
     h === nothing && return fill!(Hv, zero(eltype(Hv)))
     ExaModels.hess_par_coord!(m, x, y, h.hessbuffer; obj_weight)
@@ -638,10 +638,27 @@ function ExaModels.htprod_par!(
     Htv::AbstractVector;
     obj_weight = one(eltype(x)),
 ) where {T,VT,E<:KAExtension}
+    NLPModels.@lencheck m.meta.nvar x v
+    NLPModels.@lencheck m.meta.ncon y
+    NLPModels.@lencheck ExaModels.get_npar(m) Htv
     h = m.ext.parhelper
     h === nothing && return fill!(Htv, zero(eltype(Htv)))
     ExaModels.hess_par_coord!(m, x, y, h.hessbuffer; obj_weight)
     return _spmv!(m.ext.backend, kerspmv2, Htv, v, h.hesssparsityj, h.hessbuffer, h.hessptrj)
+end
+
+function _scatter!(backend, A, coord, vals, ptr)
+    fill!(A, zero(eltype(A)))
+    isempty(coord) || kerscatter(backend)(A, coord, vals, ptr; ndrange = length(ptr) - 1)
+    synchronize(backend)
+    return A
+end
+
+function _spmv!(backend, kernel, y, v, coord, vals, ptr)
+    fill!(y, zero(eltype(y)))
+    isempty(coord) || kernel(backend)(y, v, coord, vals, ptr; ndrange = length(ptr) - 1)
+    synchronize(backend)
+    return y
 end
 
 

@@ -3,12 +3,11 @@ module SensitivityTest
 using Test
 using ExaModels
 using NLPModelsExtensions
-using SparseArrays
-import NLPModels: jac_structure!, jac_coord!, hess_structure!, hess_coord!
+import NLPModels: jac_structure!, jac_coord!, hess_structure!, hess_coord!, DimensionError
 
 import ..BACKENDS
 
-function _model(backend, a0, θ0; sensitivity = Val(true))
+function _model(backend, a0, θ0; sensitivity = Val(true), oracle = nothing)
     c = ExaCore(; backend)
     @add_par(c, a, a0)
     @add_par(c, θ, θ0; sensitivity = sensitivity)
@@ -16,8 +15,16 @@ function _model(backend, a0, θ0; sensitivity = Val(true))
     @add_obj(c, θ[1] * x[1]^2)
     @add_con(c, s, θ[i] * x[i]^2 - a[1] for i = 1:2)
     @add_con!(c, s, i => θ[2] * x[i] for i = 1:2)
+    oracle === nothing || (c = constraint(c, oracle))
     return ExaModel(c), θ, a
 end
+
+_oracle() = VectorNonlinearOracle(
+    nvar = 2, ncon = 1, nnzj = 2, nnzh = 0, jac_rows = [1, 1], jac_cols = [1, 2],
+    lcon = [0.0], ucon = [0.0], adapt = Val(true),
+    f! = (cv, xv) -> (cv[1] = xv[1] - xv[2]; nothing),
+    jac! = (vv, xv) -> (vv[1] = 1.0; vv[2] = -1.0; nothing),
+)
 
 # manually calculated dc/dp, d^2L/dxdp w/ L = w f + y^T c
 function _expected(x, y, w)
@@ -97,6 +104,11 @@ function runtests()
             @test Array(get_par(m)) == 2θ0
             set_par!(m, ExaModels.convert_array(θ0, backend))
             @test Array(get_par(m)) == θ0
+            @test_throws DimensionMismatch set_par!(m, [1.0, 2.0, 3.0])
+            @test_throws DimensionError jprod_par!(m, x, similar(x, 1), similar(x, 2))
+            if backend !== nothing
+                @test_throws DimensionMismatch jac_par_dense!(m, x, similar(x, 1, 1))
+            end
 
             m0 = _model(backend, a0, θ0; sensitivity = Val(false))[1]
             @test get_npar(m0) == 0 && get_nnzj_par(m0) == 0 && get_nnzh_par(m0) == 0
@@ -104,6 +116,13 @@ function runtests()
             @test iszero(Array(jprod_par(m0, x, similar(x, 0))))
             @test (m0.meta.nnzj, m0.meta.nnzh) == (m.meta.nnzj, m.meta.nnzh)
             @test _jac(m0, x) == _jac(m, x) && _hess(m0, x, y) == _hess(m, x, y)
+
+            mo = _model(backend, a0, θ0; oracle = _oracle())[1]
+            yo = ExaModels.convert_array([yh; 0.7], backend)
+            @test mo isa ExaModels.ExaModelWithOracle && get_npar(mo) == 2
+            @test Array(jac_par_dense!(mo, x, similar(x, 3, 2))) ≈ [J; 0.0 0.0]
+            @test Array(hess_par_dense!(mo, x, yo, similar(x, 2, 2))) ≈ H
+            @test Array(jprod_par(mo, x, v)) ≈ [J * vh; 0.0]
         end
     end
 end
